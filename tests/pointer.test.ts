@@ -1,9 +1,10 @@
 // tests/pointer.test.ts — Phase 2 (EvidencePointer + sandbox + S3a reproducer)
 
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import {
   parsePointer,
   validateCommand,
@@ -350,5 +351,425 @@ describe("P2-2 — reproduceFile caps bytes read (no whole-file slurp)", () => {
     );
     expect(rec.reproduced).toBe(true);
     expect((rec.detail as { truncated?: boolean }).truncated).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// Wave 7 hardening — PERMANENT regression guards (one per finding). Each asserts
+// the original VERIFIED exploit now FAILS CLOSED (rejected / reproduced:false),
+// never a mutation or an out-of-root read.
+// ===========================================================================
+
+// S1 — git MUTATING subcommands run under repoRoot through the head-only check.
+// VERIFIED: `git clean -fd` deleted an untracked file; `git reset --hard`
+// destroyed uncommitted work; `git init` created .git. Now REJECTED at parse
+// (validateCommand ok:false) so the mutation never spawns.
+describe("S1 — git read-only subcommand allowlist (no mutating git)", () => {
+  test.each([
+    "git clean -fd",
+    "git reset --hard",
+    "git init",
+    "git checkout .",
+    "git rm file",
+    "git stash",
+    "git commit -m x",
+    "git add .",
+    "git fetch",
+    "git pull",
+    "git push",
+    "git merge main",
+    "git branch x",
+    "git gc",
+    "git tag v1",
+  ])("MUTATING %p is REJECTED at parse (no spawn, no mutation)", (cmd: string) => {
+    expect(validateCommand(cmd).ok).toBe(false);
+    // Also rejected through the full pointer parse (never reaches the sandbox).
+    const p = parsePointer({ type: "command", cmd, expectExit: 0, mustMatch: { kind: "empty" } });
+    expect(p.ok).toBe(false);
+  });
+
+  test("bare `git` with NO subcommand is REJECTED", () => {
+    expect(validateCommand("git").ok).toBe(false);
+  });
+
+  test("READ-ONLY git subcommands remain accepted", () => {
+    for (const sub of ["log", "show", "status", "diff", "cat-file", "rev-parse", "ls-files", "blame", "grep"]) {
+      expect(validateCommand(`git ${sub}`).ok).toBe(true);
+    }
+  });
+
+  test("REPRO: `git clean -fd` does NOT delete an untracked file (fail-closed)", () => {
+    // Lay an untracked file under the root, run the exploit through reproduce(),
+    // assert it is non-reproducible AND the file is still present.
+    const victim = join(repoRoot, "untracked-victim.txt");
+    writeFileSync(victim, "do not delete me\n");
+    const rec = reproduce(
+      { type: "command", cmd: "git clean -fd", expectExit: 0, mustMatch: { kind: "empty" } },
+      repoRoot,
+    );
+    expect(rec.reproduced).toBe(false);
+    expect(rec.reachable).toBe(false);
+    expect((rec.detail as { stage?: string }).stage).toBe("parse"); // rejected before exec
+    expect(existsSync(victim)).toBe(true); // NO mutation
+  });
+});
+
+// S2 — path-bearing flags bypassed resolveUnderRoot via the blanket `-` skip.
+// VERIFIED: `git --git-dir=../external/.git show HEAD:secret.txt` read OUTSIDE
+// repoRoot. Now the flag value is routed through resolveUnderRoot and rejected
+// on escape (the `show` subcommand passes S1; S2's containment catches the dir).
+describe("S2 — path-bearing flags are contained, not blanket-skipped", () => {
+  test("REPRO: `git --git-dir=<external>` escape → reproduced:false (resolve-arg reject)", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "sli-s2-")));
+    const inner = join(base, "repo");
+    const external = join(base, "external");
+    mkdirSync(inner);
+    mkdirSync(external);
+    // A real committed git repo OUTSIDE the sandbox root, holding a secret.
+    const g = (args: string[], cwd: string) => spawnSync("git", args, { cwd, encoding: "utf8" });
+    g(["init", "-q"], external);
+    g(["config", "user.email", "x@x"], external);
+    g(["config", "user.name", "x"], external);
+    writeFileSync(join(external, "secret.txt"), "TOP SECRET\n");
+    g(["add", "."], external);
+    g(["commit", "-q", "-m", "x"], external);
+
+    // S1 lets `show` through (read-only); S2 must reject the --git-dir escape.
+    expect(validateCommand("git --git-dir=../external/.git show HEAD:secret.txt").ok).toBe(true);
+    const rec = reproduce(
+      {
+        type: "command",
+        cmd: "git --git-dir=../external/.git show HEAD:secret.txt",
+        expectExit: 0,
+        mustMatch: { kind: "substring", value: "TOP SECRET" },
+      },
+      inner,
+    );
+    expect(rec.reproduced).toBe(false);
+    expect(rec.reachable).toBe(false);
+    expect((rec.detail as { stage?: string }).stage).toBe("resolve-arg");
+
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  test("a contained `-f` pattern-file flag with an escaping value → rejected", () => {
+    // grep -f reads its pattern from a file; an escaping path must be rejected.
+    const rec = reproduce(
+      { type: "command", cmd: "grep -f ../escape/patterns config.yaml", expectExit: 0, mustMatch: { kind: "empty" } },
+      repoRoot,
+    );
+    expect(rec.reproduced).toBe(false);
+    expect(rec.reachable).toBe(false);
+    expect((rec.detail as { stage?: string }).stage).toBe("resolve-arg");
+  });
+
+  test("a genuinely path-free flag (-n) still passes through (no over-reject)", () => {
+    const rec = reproduce(
+      { type: "command", cmd: "grep -n enabled config.yaml", expectExit: 0, mustMatch: { kind: "substring", value: "enabled: false" } },
+      repoRoot,
+    );
+    expect(rec.reachable).toBe(true);
+    expect(rec.reproduced).toBe(true);
+  });
+});
+
+// S3 — slicing text to a prefix before re.test() is UNSOUND for END-ANCHORED
+// patterns. VERIFIED: 104k text, prefix ends "SAFE", full ends "MORE" →
+// slice-test=true while full-text /SAFE$/=false (a FALSE PASS). Now matches()
+// FAILS CLOSED (returns false) for any text above the cap.
+describe("S3 — anchored regex over the cap fails closed (no false PASS)", () => {
+  test("REPRO: /SAFE$/ on a 104k text whose prefix ends SAFE but full ends MORE → false", () => {
+    const CAP = 100_000;
+    // First 100k chars end in "SAFE" (the slice boundary); the genuine full text
+    // ends in "MORE", so full-text /SAFE$/ is FALSE.
+    const text = "x".repeat(CAP - 4) + "SAFE" + "x".repeat(100) + "MORE";
+    expect(text.length).toBeGreaterThan(CAP);
+    expect(/SAFE$/.test(text)).toBe(false); // the genuine answer
+    // matches() must NOT report a spurious true from the truncated prefix.
+    expect(matches(text, { kind: "regex", value: "SAFE$" })).toBe(false);
+  });
+
+  test("a within-cap anchored match is still honest (no over-reject under the cap)", () => {
+    expect(matches("hello SAFE", { kind: "regex", value: "SAFE$" })).toBe(true);
+    expect(matches("SAFE then more", { kind: "regex", value: "SAFE$" })).toBe(false);
+  });
+});
+
+// S4 — recursive/symlink-following grep can read OUTSIDE repoRoot.
+// VERIFIED: `grep -RS .` read an external symlink target. Now the symlink-
+// following / recursive-deref grep flags are rejected at parse.
+describe("S4 — grep symlink-following / recursive flags rejected", () => {
+  test.each([
+    "grep -RS .",
+    "grep -R .",
+    "grep -r pattern .",
+    "grep -rn pattern .",
+    "grep --dereference-recursive pattern .",
+    "grep --dereference pattern file",
+    "grep -O pattern file",
+    "grep --dereference-argument pattern file",
+  ])("recursive/deref grep %p is REJECTED at parse", (cmd: string) => {
+    expect(validateCommand(cmd).ok).toBe(false);
+  });
+
+  test("non-recursive grep flags (-n, -i, -c) remain accepted", () => {
+    expect(validateCommand("grep -n pattern config.yaml").ok).toBe(true);
+    expect(validateCommand("grep -i pattern config.yaml").ok).toBe(true);
+    expect(validateCommand("grep -c pattern config.yaml").ok).toBe(true);
+  });
+
+  test("REPRO: `grep -RS .` against the symlink-escaping root → reproduced:false", () => {
+    // escape-dir is a symlink out of the root (set up in beforeAll). A recursive
+    // grep would follow it; the flag is now rejected pre-exec.
+    const rec = reproduce(
+      { type: "command", cmd: "grep -RS TOP escape-dir", expectExit: 0, mustMatch: { kind: "substring", value: "TOP SECRET" } },
+      repoRoot,
+    );
+    expect(rec.reproduced).toBe(false);
+    expect(rec.reachable).toBe(false);
+  });
+});
+
+// S6 — the screen only marked *,+,{n,} as inner-unbounded, so optional-`?`
+// shapes slipped through and burned seconds. VERIFIED: (a?)+b=880ms,
+// (a*)?b=4318ms at 100k. Now these are rejected at parse.
+describe("S6 — optional-`?` group shapes rejected (catastrophic-backtracking)", () => {
+  test.each(["(a?)+b", "(a*)?b", "(a?)*b", "([a-z]?)+9"])(
+    "parsePointer REJECTS optional-`?` shape %p",
+    (value: string) => {
+      const r = parsePointer({ type: "file", path: "x", mustMatch: { kind: "regex", value } });
+      expect(r.ok).toBe(false);
+    },
+  );
+
+  test("(a?)+b and (a*)?b are bounded (< 1s) via parse rejection — no event-loop burn", () => {
+    for (const value of ["(a?)+b", "(a*)?b"]) {
+      const t0 = performance.now();
+      const r = parsePointer({ type: "file", path: "x", mustMatch: { kind: "regex", value } });
+      const elapsedMs = performance.now() - t0;
+      expect(r.ok).toBe(false);
+      expect(elapsedMs).toBeLessThan(1000);
+    }
+  });
+
+  test("SAFE optional shapes are NOT over-rejected", () => {
+    // A `?` body with no outer ambiguity, or a `?` group with a safe body, still parse.
+    for (const value of ["(a?)b", "(ab)?c", "foo(bar)?", "(ab)+c", "a{1,5}"]) {
+      const r = parsePointer({ type: "file", path: "x", mustMatch: { kind: "regex", value } });
+      expect(r.ok).toBe(true);
+    }
+  });
+});
+
+// ===========================================================================
+// Wave 7.1 — cross-model (codex GPT-5.5) ADJACENT-VECTOR regression guards. The
+// Wave 7 fixes closed the named exploit but left an ADJACENT vector of the SAME
+// class open (independently reproduced on disk against the patched code). Each
+// guard asserts the codex bypass now FAILS CLOSED *and* the safe control still
+// works — so the next adjacent vector of the class is closed, not just the
+// single instance.
+// ===========================================================================
+
+// S1 (Wave 7.1) — the W7 subcommand scanner `find(a => !a.startsWith("-"))` is
+// VALUE-BLIND: a separate-form value-taking global flag (`-C status`, `-c x=y`,
+// `--git-dir status`) puts a read-only NAME (the flag's VALUE) where the scanner
+// looks, so the REAL mutating subcommand runs unchecked. VERIFIED on disk:
+// `git -C status clean -fd` deleted a victim under repoRoot/status;
+// `git -C status reset --hard` destroyed uncommitted work. The scanner now
+// consumes value-taking global flags' values so a value is never the subcommand.
+describe("S1 (Wave 7.1) — value-blind git subcommand scan (separate-form global flag values)", () => {
+  test.each([
+    "git -C status clean",
+    "git -c x=y clean",
+    "git -Cstatus clean",
+    "git --git-dir status clean",
+    "git -C status reset --hard",
+    "git --git-dir foo checkout .",
+    "git -c a.b=c rm file",
+  ])("VALUE-BLIND mutation %p is REJECTED (value not read as subcommand)", (cmd: string) => {
+    expect(validateCommand(cmd).ok).toBe(false);
+    expect(
+      parsePointer({ type: "command", cmd, expectExit: 0, mustMatch: { kind: "empty" } }).ok,
+    ).toBe(false);
+  });
+
+  test("MUST still ACCEPT the safe controls (value happens to equal a read-only name)", () => {
+    for (const cmd of [
+      "git -C status status",
+      "git status",
+      "git log --oneline",
+      "git --git-dir=contained log",
+      "git -c x=y log",
+    ]) {
+      expect(validateCommand(cmd).ok).toBe(true);
+    }
+  });
+
+  test("REPRO: `git -C status clean -fd` does NOT delete a victim under repoRoot/status", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "sli-s1v-")));
+    spawnSync("git", ["init", "-q"], { cwd: root });
+    mkdirSync(join(root, "status"));
+    const victim = join(root, "status", "victim.txt");
+    writeFileSync(victim, "do not delete me\n"); // untracked → `clean -fd` would delete
+    const rec = reproduce(
+      { type: "command", cmd: "git -C status clean -fd", expectExit: 0, mustMatch: { kind: "empty" } },
+      root,
+    );
+    expect(rec.reproduced).toBe(false);
+    expect(rec.reachable).toBe(false);
+    expect((rec.detail as { stage?: string }).stage).toBe("parse"); // rejected before exec
+    expect(existsSync(victim)).toBe(true); // NO mutation — file survives
+    rmSync(root, { recursive: true, force: true });
+  });
+});
+
+// S2 (Wave 7.1) — the W7 containment loop enumerated a FIXED path-bearing flag
+// list, so a non-enumerated path flag (`--output=`) slipped the `arg.startsWith
+// ("--")` branch and WROTE a file OUTSIDE repoRoot via an allowlisted read-only
+// subcommand (VERIFIED on disk: `git diff --output=../x` / `git log --output=../x`
+// wrote outside). Containment is now VALUE-BASED: ANY flag value that looks like
+// a path is routed through resolveUnderRoot.
+describe("S2 (Wave 7.1) — value-based path containment (non-enumerated --output= flag)", () => {
+  test.each([
+    "git diff --output=../escape.patch",
+    "git log --output=../escape.txt",
+    "git diff -o../escape.patch",
+    "git diff --output-directory=../elsewhere",
+  ])("path-looking flag value %p escaping the root → reproduced:false (resolve-arg reject)", (cmd: string) => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "sli-s2v-")));
+    const inner = join(base, "repo");
+    mkdirSync(inner);
+    spawnSync("git", ["init", "-q"], { cwd: inner });
+    spawnSync("git", ["config", "user.email", "x@x"], { cwd: inner });
+    spawnSync("git", ["config", "user.name", "x"], { cwd: inner });
+    writeFileSync(join(inner, "a.txt"), "one\n");
+    spawnSync("git", ["add", "."], { cwd: inner });
+    spawnSync("git", ["commit", "-q", "-m", "x"], { cwd: inner });
+    writeFileSync(join(inner, "a.txt"), "two\n"); // create an unstaged diff
+
+    const outside = join(base, "escape.patch");
+    const outsideTxt = join(base, "escape.txt");
+    const rec = reproduce(
+      { type: "command", cmd, expectExit: 0, mustMatch: { kind: "empty" } },
+      inner,
+    );
+    expect(rec.reproduced).toBe(false);
+    expect(rec.reachable).toBe(false);
+    expect((rec.detail as { stage?: string }).stage).toBe("resolve-arg");
+    expect(existsSync(outside)).toBe(false); // NO out-of-root write
+    expect(existsSync(outsideTxt)).toBe(false);
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  test("MUST still ACCEPT path-free read-only commands (no over-reject)", () => {
+    const inner = realpathSync(mkdtempSync(join(tmpdir(), "sli-s2ok-")));
+    spawnSync("git", ["init", "-q"], { cwd: inner });
+    spawnSync("git", ["config", "user.email", "x@x"], { cwd: inner });
+    spawnSync("git", ["config", "user.name", "x"], { cwd: inner });
+    writeFileSync(join(inner, "a.txt"), "one\n");
+    spawnSync("git", ["add", "."], { cwd: inner });
+    spawnSync("git", ["commit", "-q", "-m", "x"], { cwd: inner });
+    writeFileSync(join(inner, "a.txt"), "two\n");
+    for (const cmd of ["git diff", "git diff --stat"]) {
+      const rec = reproduce(
+        { type: "command", cmd, expectExit: 0, mustMatch: { kind: "substring", value: "a.txt" } },
+        inner,
+      );
+      expect(rec.reachable).toBe(true);
+    }
+    // `git log --oneline` has no path value → not contained, runs fine.
+    expect(validateCommand("git log --oneline").ok).toBe(true);
+    rmSync(inner, { recursive: true, force: true });
+  });
+});
+
+// S4 (Wave 7.1) — W7 gated grep's symlink flags and steered recursion to rg, but
+// left rg's OWN `--follow`/`-L` open: ripgrep does not follow symlinks by default,
+// but `--follow` re-enables it, so an in-root symlink whose realpath is OUTSIDE
+// the root is read again (VERIFIED on disk: `rg --follow MARKER .` read an
+// out-of-root secret). rg's symlink-follow flags are now rejected at parse.
+describe("S4 (Wave 7.1) — rg --follow symlink-follow flag ban", () => {
+  test.each([
+    "rg --follow MARKER .",
+    "rg -L MARKER .",
+    "rg -Ln MARKER .",
+    "rg -nL MARKER .",
+  ])("symlink-following rg %p is REJECTED at parse", (cmd: string) => {
+    expect(validateCommand(cmd).ok).toBe(false);
+  });
+
+  test("grep parse-gap flags (--recursive, -d recurse, --directories=recurse) also rejected (honest screen)", () => {
+    for (const cmd of [
+      "grep --recursive pattern .",
+      "grep -d recurse pattern .",
+      "grep --directories recurse pattern .",
+      "grep --directories=recurse pattern .",
+    ]) {
+      expect(validateCommand(cmd).ok).toBe(false);
+    }
+  });
+
+  test("MUST still ACCEPT non-symlink-follow reads (rg . and single-file grep)", () => {
+    expect(validateCommand("rg MARKER .").ok).toBe(true);
+    expect(validateCommand("grep -n MARKER file").ok).toBe(true);
+    expect(validateCommand("rg -n MARKER .").ok).toBe(true); // -n alone is fine
+  });
+
+  test("REPRO: `rg --follow MARKER .` does NOT read an out-of-root symlink target", () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "sli-s4v-")));
+    const inner = join(base, "repo");
+    const outside = join(base, "outside");
+    mkdirSync(inner);
+    mkdirSync(outside);
+    writeFileSync(join(outside, "secret.txt"), "MARKER_SECRET\n");
+    symlinkSync(join(outside, "secret.txt"), join(inner, "link.txt")); // in-root → outside
+    writeFileSync(join(inner, "normal.txt"), "MARKER ordinary\n");
+    const rec = reproduce(
+      { type: "command", cmd: "rg --follow MARKER .", expectExit: 0, mustMatch: { kind: "substring", value: "MARKER_SECRET" } },
+      inner,
+    );
+    expect(rec.reproduced).toBe(false);
+    expect(rec.reachable).toBe(false);
+    expect((rec.detail as { stage?: string }).stage).toBe("parse"); // rejected before exec
+    rmSync(base, { recursive: true, force: true });
+  });
+});
+
+// S6 (Wave 7.1) — two adjacent vectors: (a) nested `((a+))+b` / `((a*))*b` SLIP
+// because inner-frame facts were NOT propagated to the parent on group close
+// (genuinely catastrophic on V8: ~429ms / ~1090ms); (b) the W7-introduced
+// REGRESSION wrongly REJECTED SAFE `(?:ab)+c` / `(?<name>ab)+c` (the special-group
+// `?` was miscounted as a body optional). Both are now fixed.
+describe("S6 (Wave 7.1) — nested-group fact propagation + special-group prefix", () => {
+  test.each(["((a+))+b", "((a*))*b", "((a?))+b", "((a*))?b", "((a|b)+)+c", "(?:a+)+b"])(
+    "SLIP shape %p is now REJECTED at parse",
+    (value: string) => {
+      const r = parsePointer({ type: "file", path: "x", mustMatch: { kind: "regex", value } });
+      expect(r.ok).toBe(false);
+    },
+  );
+
+  test("the genuinely-catastrophic ((a+))+b / ((a*))*b are bounded (< 1s) via parse rejection", () => {
+    for (const value of ["((a+))+b", "((a*))*b"]) {
+      const t0 = performance.now();
+      const r = parsePointer({ type: "file", path: "x", mustMatch: { kind: "regex", value } });
+      const elapsedMs = performance.now() - t0;
+      expect(r.ok).toBe(false);
+      expect(elapsedMs).toBeLessThan(1000); // no event-loop burn — never compiled/run
+    }
+  });
+
+  test("W7-REGRESSION GUARD: SAFE special-group shapes are NOT over-rejected", () => {
+    for (const value of [
+      "(?:ab)+c", // non-capture group repeat — SAFE
+      "(?<name>ab)+c", // named group repeat — SAFE
+      "(?=ab)c", // look-ahead
+      "(?!ab)c", // negative look-ahead
+      "(?<=ab)c", // look-behind
+      "(?<!ab)c", // negative look-behind
+    ]) {
+      const r = parsePointer({ type: "file", path: "x", mustMatch: { kind: "regex", value } });
+      expect(r.ok).toBe(true);
+    }
   });
 });

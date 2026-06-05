@@ -205,3 +205,121 @@ describe("sliWave — relevanceQuorum config validated at entry (codex P3-a)", (
     expect(res).toHaveLength(1);
   });
 });
+
+// ===========================================================================
+// S5 — a POISONED property getter (a worker ships a claim whose `id` accessor
+// throws) made adjudicate/pre-scan throw and REJECTED the whole sliWave promise,
+// dropping ALL receipts (VERIFIED). Now one bad claim BLOCKs ONLY itself and the
+// sibling still gets its receipt. PERMANENT regression guard.
+// ===========================================================================
+describe("S5 — poisoned-getter claim BLOCKs only itself (batch survives)", () => {
+  function poisonedClaim(): Record<string, unknown> {
+    const c: Record<string, unknown> = {
+      layer: "BEHAVIOR",
+      assertion: "poisoned",
+      evidence: [{ kind: "observed", args: ["s"] }],
+      verdict: { status: "PASS" },
+    };
+    // A throwing `id` accessor — accessing claim.id throws (poisoned getter).
+    Object.defineProperty(c, "id", {
+      enumerable: true,
+      get() {
+        throw new Error("poisoned id getter");
+      },
+    });
+    return c;
+  }
+
+  test("a poisoned claim in a 2-item batch → per-claim BLOCK; sibling keeps its receipt", async () => {
+    const good = {
+      id: "good_sibling",
+      layer: "BEHAVIOR",
+      assertion: "the sibling is fine",
+      evidence: [{ kind: "observed", args: ["s"] }],
+      verdict: { status: "PASS" },
+    };
+    const map: Record<string, unknown> = { poison: poisonedClaim(), good };
+    const dispatch: Dispatch = async (prompt) => map[prompt];
+
+    // The OLD code rejected the entire promise (one throw dropped all receipts);
+    // the batch must now RESOLVE with both receipts.
+    const res = await sliWave(["poison", "good"], { work, ableSchema: ABLE_SCHEMA, dispatch });
+    expect(res).toHaveLength(2);
+
+    // The poisoned item → per-claim BLOCK (ADJUDICATE_THREW), fail-closed.
+    expect(res[0]!.receipt.verdict_adjudicated).toBe("BLOCK");
+    expect(res[0]!.receipt.hard_structural).toBe(true);
+    expect(res[0]!.receipt.rule_codes).toContain("ADJUDICATE_THREW");
+    expect(res[0]!.wave_key).toBe("wave_0");
+
+    // The sibling is UNAFFECTED — it got its real receipt (no whole-batch reject).
+    expect(res[1]!.receipt.verdict_adjudicated).toBe("PASS_UNVERIFIED");
+    expect(res[1]!.receipt.claim_id).toBe("good_sibling");
+    expect(res[1]!.wave_key).toBe("wave_1");
+  });
+});
+
+// ===========================================================================
+// S5 (Wave 7.1) — ADJACENT vector of the poisoned-getter class. W7 wrapped the
+// NORMAL branch's adjudicate/assertion/layer reads, but the DUPLICATE-id branch
+// still called assertionOf/layerOf OUTSIDE the try, so a dup claim with a
+// poisoned `assertion`/`layer` getter REJECTED the whole sliWave promise and
+// dropped EVERY sibling receipt (VERIFIED). The dup branch now degrades a
+// throwing getter to a per-claim ADJUDICATE_THREW BLOCK; the sibling survives.
+// ===========================================================================
+describe("S5 (Wave 7.1) — poisoned getter in the DUPLICATE-id branch (batch survives)", () => {
+  function poisonedDup(prop: "assertion" | "layer"): Record<string, unknown> {
+    const c: Record<string, unknown> = {
+      id: "shared_id",
+      layer: "BEHAVIOR",
+      assertion: "poisoned dup",
+      evidence: [{ kind: "observed", args: ["s"] }],
+      verdict: { status: "PASS" },
+    };
+    // Re-define the chosen property as a THROWING getter (poisoned). Both
+    // `assertion` and `layer` are read in the dup branch outside the main try.
+    Object.defineProperty(c, prop, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        throw new Error(`poisoned ${prop} getter`);
+      },
+    });
+    return c;
+  }
+
+  test.each(["assertion", "layer"] as const)(
+    "a dup pair where one claim has a poisoned %p getter → per-claim BLOCK; sibling survives",
+    async (prop) => {
+      const cleanDup = {
+        id: "shared_id", // SAME id → both are duplicates
+        layer: "BEHAVIOR",
+        assertion: "clean dup sibling",
+        evidence: [{ kind: "observed", args: ["s"] }],
+        verdict: { status: "PASS" },
+      };
+      const map: Record<string, unknown> = { poison: poisonedDup(prop), clean: cleanDup };
+      const dispatch: Dispatch = async (prompt) => map[prompt];
+
+      // OLD code: the poisoned getter threw in the dup branch and rejected the
+      // WHOLE promise. Now the batch RESOLVES with both receipts.
+      const res = await sliWave(["poison", "clean"], { work, ableSchema: ABLE_SCHEMA, dispatch });
+      expect(res).toHaveLength(2);
+
+      // Poisoned dup → per-claim ADJUDICATE_THREW BLOCK (fail-closed).
+      expect(res[0]!.receipt.verdict_adjudicated).toBe("BLOCK");
+      expect(res[0]!.receipt.hard_structural).toBe(true);
+      expect(res[0]!.receipt.rule_codes).toContain("ADJUDICATE_THREW");
+      expect(res[0]!.wave_key).toBe("wave_0");
+
+      // The clean dup sibling still gets its own receipt (a dup BLOCK, with its
+      // assertion intact) — NOT a whole-batch reject.
+      expect(res[1]!.receipt.verdict_adjudicated).toBe("BLOCK");
+      expect(res[1]!.receipt.rule_codes).toContain("MALFORMED_CLAIM");
+      expect((res[1]!.receipt.claim_json as { assertion?: string }).assertion).toBe(
+        "clean dup sibling",
+      );
+      expect(res[1]!.wave_key).toBe("wave_1");
+    },
+  );
+});

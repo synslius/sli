@@ -29,6 +29,35 @@ describe("adjudicate.mjs — in-process batch helper", () => {
     expect(out[1]!.verdict_adjudicated).toBe("BLOCK");
     expect(out[0]!.rules_fired[0]!.code).toBe("MALFORMED_CLAIM");
   });
+
+  // S5 — a poisoned `id` getter in the dup PRE-SCAN (read outside try/catch in the
+  // old code) threw and rejected the whole batch. Now readId() is defensive: a
+  // throwing claim BLOCKs only itself and the sibling is still adjudicated.
+  test("S5 — poisoned-getter claim BLOCKs only itself (no whole-batch throw)", () => {
+    const poisoned: Record<string, unknown> = {
+      layer: "BEHAVIOR",
+      assertion: "poisoned",
+      evidence: [{ kind: "observed", args: ["s"] }],
+      verdict: { status: "PASS" },
+    };
+    Object.defineProperty(poisoned, "id", {
+      enumerable: true,
+      get() {
+        throw new Error("poisoned id getter");
+      },
+    });
+    // adjudicateBatch must NOT throw; it returns a per-claim result array.
+    const out = adjudicateBatch([
+      poisoned,
+      { id: "ok", layer: "BEHAVIOR", assertion: "y", evidence: [{ kind: "observed", args: ["s"] }], verdict: { status: "PASS" } },
+    ]);
+    expect(out).toHaveLength(2);
+    // The poisoned claim BLOCKs (adjudicate threw on the poisoned read).
+    expect(out[0]!.verdict_adjudicated).toBe("BLOCK");
+    expect(out[0]!.rules_fired[0]!.code).toBe("ADJUDICATE_THREW");
+    // The sibling is unaffected.
+    expect(out[1]!.verdict_adjudicated).toBe("PASS_UNVERIFIED");
+  });
 });
 
 describe("adjudicate.mjs — stdin→stdout CLI bridge", () => {

@@ -95,6 +95,82 @@ export const COMMAND_HEAD_ALLOWLIST: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Read-only `git` SUBCOMMAND allowlist (S1). The head-allowlist only checks
+ * argv[0]; without a subcommand gate a MUTATING git subcommand (init, reset,
+ * clean, checkout, rm, stash, commit, add, fetch, pull, push, merge, branch,
+ * gc, tag, …) would run under repoRoot and destroy state (VERIFIED: `git clean
+ * -fd` deleted an untracked file; `git reset --hard` destroyed uncommitted work;
+ * `git init` created .git). So when head==="git" we require argv[1] to be one of
+ * these strictly read-only subcommands; everything else (and a bare `git` with
+ * NO subcommand) is rejected before execution.
+ */
+export const GIT_READONLY_SUBCOMMAND_ALLOWLIST: ReadonlySet<string> = new Set([
+  "log",
+  "show",
+  "status",
+  "diff",
+  "cat-file",
+  "rev-parse",
+  "rev-list",
+  "ls-files",
+  "ls-tree",
+  "blame",
+  "grep",
+  "describe",
+  "for-each-ref",
+  "show-ref",
+  "symbolic-ref",
+]);
+
+/**
+ * `git` GLOBAL flags (the ones that appear BEFORE the subcommand) that take
+ * their value as a SEPARATE next token (`-C status`, `--git-dir foo`). When the
+ * subcommand scanner hits one of these it MUST skip the next token too — that
+ * token is the flag's VALUE, never a subcommand (S1). Attached forms carry
+ * their own value (`-Cstatus`, `--git-dir=foo`, `-cx=y`) and consume nothing
+ * extra. Without this, `git -C status clean` reads `status` (the -C VALUE) as
+ * the subcommand and lets the mutating `clean` through.
+ */
+const GIT_GLOBAL_VALUE_SHORT: ReadonlySet<string> = new Set(["-C", "-c"]);
+const GIT_GLOBAL_VALUE_LONG: ReadonlySet<string> = new Set([
+  "--git-dir",
+  "--work-tree",
+  "--exec-path",
+  "--namespace",
+  "--super-prefix",
+]);
+
+/**
+ * Locate the git subcommand token, consuming the VALUES of separate-form
+ * value-taking global flags so a value can never be mis-read as the subcommand
+ * (S1). Returns the first genuine non-flag token, or undefined for bare `git`.
+ */
+function findGitSubcommand(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const tok = args[i]!;
+    if (!tok.startsWith("-")) {
+      return tok; // first genuine non-flag token is the subcommand
+    }
+    // It's a flag. If it is a SEPARATE-form value-taking global flag (the exact
+    // bare flag, no `=` / no attached value), the NEXT token is its value — skip
+    // it so it can't be read as the subcommand.
+    if (tok.startsWith("--")) {
+      // Attached long form `--git-dir=path` carries its own value → no skip.
+      if (!tok.includes("=") && GIT_GLOBAL_VALUE_LONG.has(tok)) {
+        i++; // consume the separate value token
+      }
+    } else {
+      // Short form. Exact `-C` / `-c` (length 2) takes a separate value; an
+      // attached `-Cpath` / `-cx=y` (length > 2) carries its own value → no skip.
+      if (tok.length === 2 && GIT_GLOBAL_VALUE_SHORT.has(tok)) {
+        i++; // consume the separate value token
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
  * Shell metacharacters that mutate, network, chain, redirect, or substitute.
  * Any occurrence in a command string → rejected. We never invoke a shell
  * (spawnSync with shell:false), but we still reject these so a metachar can
@@ -119,6 +195,95 @@ const FORBIDDEN_METACHARS: readonly string[] = [
   "~",
   "\\",
 ];
+
+/**
+ * Symlink-following / recursive-dereference `grep` flags banned outright (S4).
+ * GNU/BSD `grep -R` (and `-S`/`--dereference-recursive`/`--dereference`/`-O`/
+ * `--dereference-argument`) follows symlinks, so a recursive grep can read an
+ * external symlink target OUTSIDE repoRoot (VERIFIED: `grep -RS .` read an
+ * external symlink target). grep does NOT get a per-arg realpath gate strong
+ * enough to defeat in-tree symlinks during recursion, so we reject the
+ * symlink-following recursive flags entirely. RECURSIVE directory search should
+ * go through `rg` (ripgrep does NOT follow symlinks by default), which is the
+ * preferred path for recursive reads in this sandbox.
+ *
+ * NOTE: plain `-r`/`--recursive` (no symlink deref) is also rejected here as a
+ * conservative fail-closed stance — recursion belongs to `rg`. Single-file grep
+ * (the common pointer shape) is unaffected.
+ */
+export const GREP_FORBIDDEN_RECURSIVE_FLAGS: ReadonlySet<string> = new Set([
+  "-R",
+  "-r",
+  "-S",
+  "--recursive",
+  "--dereference-recursive",
+  "--dereference",
+  "-O",
+  "--dereference-argument",
+  // `--directories=recurse` / `-d recurse` make grep recurse the same way `-r`
+  // does (GNU). codex flagged these as parse-gaps: on BSD/GNU they don't widen
+  // the escape beyond `-r` (already banned), but we reject them anyway so the
+  // screen is HONEST about what it covers (defense-in-depth, not a live hole).
+  "--directories=recurse",
+]);
+
+/**
+ * Symlink-following `rg` (ripgrep) flags banned outright (S4). ripgrep does NOT
+ * follow symlinks by default — that is why recursion is steered to `rg` — but
+ * `--follow` / `-L` re-enables symlink traversal, so an in-root symlink whose
+ * realpath is OUTSIDE repoRoot becomes readable again (VERIFIED: `rg --follow
+ * MARKER .` read a file resolving outside the root). Reject the long flag, its
+ * short alias `-L`, and any bundled short cluster containing `L` (e.g. `-Ln`).
+ */
+export const RG_FORBIDDEN_SYMLINK_FLAGS: ReadonlySet<string> = new Set([
+  "--follow",
+  "-L",
+]);
+
+/**
+ * PATH-BEARING flags per head (S2). These flags take a filesystem path as their
+ * value and so can REDIRECT a read outside repoRoot if not contained (VERIFIED:
+ * `git --git-dir=../external/.git show HEAD:secret.txt` read OUTSIDE repoRoot).
+ * The containment loop in reproduceCommand must NOT blanket-skip `-`-prefixed
+ * args: for these flags it extracts the path value (attached `--git-dir=PATH` /
+ * `-fPATH`, or the following separate token `-f PATH`) and routes it through
+ * resolveUnderRoot, rejecting any value that escapes the root. Genuinely
+ * path-free flags (`-n`, `-i`, `--oneline`, …) are still skipped.
+ *
+ * `long`  — long-form flags whose value is a path (attached via `=` or the next
+ *           token).
+ * `short` — single-dash short flags whose value is a path (attached as `-fPATH`
+ *           or the next token `-f PATH`).
+ */
+const PATH_BEARING_FLAGS: Record<string, { long: ReadonlySet<string>; short: ReadonlySet<string> }> = {
+  git: {
+    long: new Set(["--git-dir", "--work-tree", "--exec-path", "--output", "--output-directory"]),
+    short: new Set(["-C", "-o"]),
+  },
+  grep: { long: new Set(["--file"]), short: new Set(["-f"]) },
+  rg: { long: new Set(["--file"]), short: new Set(["-f"]) },
+};
+
+/**
+ * True if a flag's VALUE looks like a filesystem path that must be CONTAINED
+ * under repoRoot (S2). The enumerated PATH_BEARING_FLAGS list is a fast-path
+ * HINT, not the gate — it is open-ended (a read-only subcommand can grow a new
+ * `--output=`-style path flag at any time, e.g. `git diff --output=../x` WROTE
+ * outside the root via an allowlisted subcommand because `--output` was not
+ * enumerated). So the REAL gate is value-based: ANY flag value that contains a
+ * path separator, starts with `..`, or resolves to an existing path under the
+ * root is treated as a path and routed through resolveUnderRoot. Genuinely
+ * path-free values (`oneline`, `5`, `recurse`) contain no separator → pass.
+ */
+function looksLikePath(realRoot: string, value: string): boolean {
+  if (value.length === 0) return false;
+  if (value.includes("/")) return true;
+  if (value.startsWith("..")) return true;
+  // A bare token that names an existing entry under the root (e.g. a relative
+  // filename with no slash) is also a path we should contain.
+  if (existsSync(pathResolve(realRoot, value))) return true;
+  return false;
+}
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000; // 1 MB cap
@@ -161,14 +326,20 @@ type RegexCriterion = { kind: "regex"; value: string; flags?: string };
  * ms (and on a naive backtracking engine, minutes). Rather than add a native
  * linear-time engine (would break the dependency-free property) or a per-match
  * worker_thread (latency + spawn-failure surface on every reproduction), we
- * reject the dangerous shape at its entry point. The two classic
- * catastrophic-backtracking roots are:
- *   1. an unbounded quantifier (`*`, `+`, `{n,}`) applied to a group whose body
- *      ITSELF contains an unbounded quantifier — e.g. `(a+)+`, `(a*)*`, `([a-z]+)*`;
- *   2. an unbounded quantifier applied to a group whose body contains a
- *      top-level ALTERNATION — e.g. `(a|a)+`, `(a|ab)*` (overlapping/ambiguous
- *      alternatives multiply the backtracking paths).
- * Rejecting both shapes (plus the input-length cap in `matches`) bounds the
+ * reject the dangerous shape at its entry point. The catastrophic-backtracking
+ * roots screened here are:
+ *   1. an ambiguity-multiplying quantifier (`*`, `+`, `{n,}`, OR `?`) applied to
+ *      a group whose body ITSELF contains an unbounded quantifier — e.g.
+ *      `(a+)+`, `(a*)*`, `([a-z]+)*`, and (S6) `(a*)?b`;
+ *   2. an ambiguity-multiplying quantifier applied to a group whose body
+ *      contains a top-level ALTERNATION — e.g. `(a|a)+`, `(a|ab)*`
+ *      (overlapping/ambiguous alternatives multiply the backtracking paths);
+ *   3. (S6) an UNBOUNDED quantifier (`*`, `+`, `{n,}`) applied to a group whose
+ *      body contains an OPTIONAL `?` — e.g. `(a?)+b`, `(a?)*b`, `([a-z]?)+9`. A
+ *      `?` inside the body makes the body ambiguous-empty-matchable, so an outer
+ *      unbounded repeat of an empty-matchable body explodes the backtracking
+ *      paths exactly like a nested unbounded quantifier does.
+ * Rejecting these shapes (plus the input-length cap in `matches`) bounds the
  * worst case to a small, measured budget.
  *
  * This is a deliberately conservative STRUCTURAL screen, not a full RE
@@ -179,9 +350,15 @@ type RegexCriterion = { kind: "regex"; value: string; flags?: string };
  */
 function hasNestedUnboundedQuantifier(src: string): boolean {
   // Walk the pattern tracking group nesting. For each group we record whether
-  // its BODY contains an unbounded quantifier OR a top-level alternation; if such
-  // a group is then itself quantified unbounded, that is the catastrophic shape.
-  type Frame = { bodyHasUnbounded: boolean; bodyHasAlternation: boolean };
+  // its BODY contains an unbounded quantifier, a top-level alternation, OR an
+  // optional `?` (S6 — `?` makes the body ambiguous-empty-matchable). If such a
+  // group is then itself ambiguity-multiplying-quantified, that is the
+  // catastrophic shape.
+  type Frame = {
+    bodyHasUnbounded: boolean;
+    bodyHasAlternation: boolean;
+    bodyHasOptional: boolean;
+  };
   const stack: Frame[] = [];
   let inClass = false; // inside a [...] character class
   for (let i = 0; i < src.length; i++) {
@@ -199,7 +376,33 @@ function hasNestedUnboundedQuantifier(src: string): boolean {
       continue;
     }
     if (c === "(") {
-      stack.push({ bodyHasUnbounded: false, bodyHasAlternation: false });
+      stack.push({ bodyHasUnbounded: false, bodyHasAlternation: false, bodyHasOptional: false });
+      // S6(b) — consume a SPECIAL-GROUP prefix so its `?` is never counted as a
+      // body optional. `(?:…)` non-capture, `(?=…)`/`(?!…)` look-ahead,
+      // `(?<=…)`/`(?<!…)` look-behind, `(?<name>…)` named group all begin with a
+      // `?` that is GROUP SYNTAX, not a `?` quantifier on the body. Without this,
+      // a SAFE `(?:ab)+c` / `(?<name>ab)+c` is wrongly REJECTED (W7 regression)
+      // because the prefix `?` marked bodyHasOptional. Advance `i` past the
+      // prefix chars so the main loop never sees them.
+      if (src[i + 1] === "?") {
+        const after = src[i + 2];
+        if (after === ":" || after === "=" || after === "!") {
+          i += 2; // skip `?` and the `:`/`=`/`!`
+        } else if (after === "<") {
+          const after2 = src[i + 3];
+          if (after2 === "=" || after2 === "!") {
+            i += 3; // look-behind `(?<=` / `(?<!`
+          } else {
+            // Named group `(?<name>…)` — skip up to and including the `>`.
+            const gt = src.indexOf(">", i + 3);
+            i = gt === -1 ? src.length : gt;
+          }
+        } else {
+          // A bare `(?` with no recognized prefix char (e.g. inline flags
+          // `(?i)`): just skip the `?` so it isn't a body optional marker.
+          i += 1;
+        }
+      }
       continue;
     }
     if (c === "|") {
@@ -215,10 +418,44 @@ function hasNestedUnboundedQuantifier(src: string): boolean {
         next === "*" ||
         next === "+" ||
         (next === "{" && isUnboundedBraceQuantifier(src, i + 1));
-      if (frame && (frame.bodyHasUnbounded || frame.bodyHasAlternation) && groupQuantUnbounded) {
-        return true; // (…unbounded…|alternation…)<unbounded> → catastrophic
+      // S6 — an OPTIONAL `?` on the group is also ambiguity-multiplying: it lets
+      // the whole (possibly unbounded-matching) body be skipped, so e.g.
+      // `(a*)?b` explodes the same way `(a+)+b` does.
+      const groupQuantOptional = next === "?";
+      const groupQuantAmbiguous = groupQuantUnbounded || groupQuantOptional;
+      if (
+        frame &&
+        (frame.bodyHasUnbounded || frame.bodyHasAlternation || frame.bodyHasOptional) &&
+        groupQuantAmbiguous
+      ) {
+        // (…unbounded…|alternation…|optional…)<unbounded|optional> → catastrophic.
+        // Covers (a+)+, (a|a)*, (a?)+b, (a?)*b, ([a-z]?)+9, and (a*)?b.
+        return true;
+      }
+      // S6(a) — PROPAGATE the popped inner frame's facts into the PARENT so a
+      // WRAPPING group inherits the danger. Without this, the inner group's facts
+      // died on pop and `((a+))+b` / `((a?))+b` / `((a*))?b` SLIPPED (the outer
+      // group's body looked fact-free even though it wraps a dangerous inner
+      // group — genuinely catastrophic on V8: ((a+))+b ≈ 429ms, ((a*))*b ≈
+      // 1090ms). We OR the inner body facts into the parent body, AND record THIS
+      // group's OWN quantifier (optional/unbounded) as a parent-body fact so a
+      // further-out wrapper also inherits.
+      if (frame && stack.length > 0) {
+        const parent = stack[stack.length - 1]!;
+        parent.bodyHasUnbounded = parent.bodyHasUnbounded || frame.bodyHasUnbounded;
+        parent.bodyHasAlternation = parent.bodyHasAlternation || frame.bodyHasAlternation;
+        parent.bodyHasOptional = parent.bodyHasOptional || frame.bodyHasOptional;
+        if (groupQuantUnbounded) parent.bodyHasUnbounded = true;
+        if (groupQuantOptional) parent.bodyHasOptional = true;
       }
       continue;
+    }
+    // An OPTIONAL `?` anywhere marks the enclosing group's body as
+    // ambiguous-empty-matchable (S6). Skip a `?` that is itself the group
+    // quantifier — that is handled at `)` above, not as a body marker — but a
+    // `?` NOT immediately after a `)` (e.g. the `?` in `(a?)`) marks the body.
+    if (c === "?" && stack.length > 0 && src[i - 1] !== ")") {
+      stack[stack.length - 1]!.bodyHasOptional = true;
     }
     // An unbounded quantifier anywhere marks the enclosing group's body.
     const unbounded =
@@ -336,6 +573,20 @@ function parseCommandCriterion(
 }
 
 export function parsePointer(raw: unknown): PointerParse {
+  // S5 — `raw` is WORKER-CONTROLLED; any property read below (`raw.type`,
+  // `raw.path`, `raw.cmd`, `raw.mustMatch`, …) can be a POISONED getter that
+  // throws. parsePointer is called from the S3 hot path (sliWave) where an
+  // unguarded throw would reject the whole wave and drop every sibling receipt.
+  // Treat a throwing accessor as an UNPARSEABLE pointer (fail-closed → non-
+  // reproducible), exactly like any other malformed pointer.
+  try {
+    return parsePointerInner(raw);
+  } catch (e) {
+    return { ok: false, error: `pointer property access threw (poisoned getter): ${(e as Error).message}` };
+  }
+}
+
+function parsePointerInner(raw: unknown): PointerParse {
   if (!isPlainObject(raw)) {
     return { ok: false, error: "pointer must be an object" };
   }
@@ -414,6 +665,81 @@ export function validateCommand(
       error: `command head ${JSON.stringify(head)} is not in the read-only allowlist (${[...COMMAND_HEAD_ALLOWLIST].join(", ")})`,
     };
   }
+  // S1 — `git` SUBCOMMAND gate. argv[0]==="git" is not enough: a MUTATING
+  // subcommand (init/reset/clean/checkout/rm/…) would run under repoRoot and
+  // destroy state. Require the first non-flag arg to be a read-only subcommand,
+  // and reject `git` with no subcommand at all. (Path-bearing global flags like
+  // `--git-dir` are separately routed through resolveUnderRoot in
+  // reproduceCommand; here we just locate the subcommand token.)
+  //
+  // The naive `find(a => !a.startsWith("-"))` is VALUE-BLIND: a separate-form
+  // value-taking global flag like `-C status` puts a NON-flag VALUE (`status`)
+  // right where the subcommand scanner looks, so `git -C status clean -fd`
+  // mis-reads `status` (an allowlisted read-only name) as the subcommand while
+  // the REAL mutating `clean` runs under repoRoot/status (VERIFIED: deleted a
+  // victim file; `git -C status reset --hard` destroyed uncommitted work). FIX:
+  // walk argv from index 1; when a SEPARATE-form value-taking global flag is
+  // seen, skip the NEXT token too (it is that flag's value, never a subcommand);
+  // attached forms (`-Cpath`, `--git-dir=path`, `-cx=y`) carry their own value
+  // and consume nothing extra. The first remaining non-flag token is the real
+  // subcommand.
+  if (head === "git") {
+    const sub = findGitSubcommand(argv.slice(1));
+    if (sub === undefined) {
+      return { ok: false, error: "git command requires a read-only subcommand (none given)" };
+    }
+    if (!GIT_READONLY_SUBCOMMAND_ALLOWLIST.has(sub)) {
+      return {
+        ok: false,
+        error: `git subcommand ${JSON.stringify(sub)} is not in the read-only subcommand allowlist (${[...GIT_READONLY_SUBCOMMAND_ALLOWLIST].join(", ")})`,
+      };
+    }
+  }
+  // S4 — `grep` symlink-following / recursive-deref flag ban. A recursive grep
+  // follows symlinks and can read OUTSIDE repoRoot; recursion belongs to `rg`
+  // (no symlink-follow by default). Reject the long-form flags AND any short
+  // flag cluster (e.g. `-RS`, `-rn`) containing a banned single-char flag.
+  if (head === "grep") {
+    const bannedShort = new Set(["R", "r", "S", "O"]);
+    const grepArgs = argv.slice(1);
+    for (let i = 0; i < grepArgs.length; i++) {
+      const arg = grepArgs[i]!;
+      if (GREP_FORBIDDEN_RECURSIVE_FLAGS.has(arg)) {
+        return { ok: false, error: `grep flag ${JSON.stringify(arg)} follows symlinks / recurses out of repoRoot — use rg for recursive reads` };
+      }
+      // `-d recurse` / `--directories recurse` (separate-value form) recurses
+      // like `-r` (GNU). Reject the recurse mode whether attached or separate.
+      if ((arg === "-d" || arg === "--directories") && grepArgs[i + 1] === "recurse") {
+        return { ok: false, error: `grep flag ${JSON.stringify(arg + " recurse")} recurses out of repoRoot — use rg for recursive reads` };
+      }
+      // Bundled short flags: `-RS`, `-rn`, … (a single dash, no `=`, not `--`).
+      if (arg.startsWith("-") && !arg.startsWith("--") && arg.length > 1) {
+        for (const ch of arg.slice(1)) {
+          if (bannedShort.has(ch)) {
+            return { ok: false, error: `grep flag ${JSON.stringify("-" + ch)} (in ${JSON.stringify(arg)}) follows symlinks / recurses out of repoRoot — use rg for recursive reads` };
+          }
+        }
+      }
+    }
+  }
+  // S4 — `rg` symlink-follow ban. ripgrep does not follow symlinks by default
+  // (that is why recursion is steered here), but `--follow`/`-L` re-enables it,
+  // re-opening the in-root-symlink-to-outside-target escape (VERIFIED: `rg
+  // --follow MARKER .` read a file resolving outside the root). Reject the long
+  // flag AND any short cluster containing `L` (e.g. `-Ln`).
+  if (head === "rg") {
+    for (const arg of argv.slice(1)) {
+      if (RG_FORBIDDEN_SYMLINK_FLAGS.has(arg)) {
+        return { ok: false, error: `rg flag ${JSON.stringify(arg)} follows symlinks out of repoRoot — symlink-following recursive reads are not permitted` };
+      }
+      // Bundled short flags: `-Ln`, `-nL`, … (single dash, no `=`, not `--`).
+      if (arg.startsWith("-") && !arg.startsWith("--") && arg.length > 1) {
+        if (arg.slice(1).includes("L")) {
+          return { ok: false, error: `rg flag "-L" (in ${JSON.stringify(arg)}) follows symlinks out of repoRoot — symlink-following recursive reads are not permitted` };
+        }
+      }
+    }
+  }
   // Reject absolute paths anywhere in the args (forces all paths under repoRoot).
   for (const arg of argv.slice(1)) {
     if (isAbsolute(arg)) {
@@ -487,18 +813,27 @@ export function matches(text: string, crit: MatchCriterion): boolean {
     case "substring":
       return text.includes(crit.value);
     case "regex": {
+      // Defense-in-depth (codex P2-1): even after the nested-quantifier screen,
+      // bound the input length handed to a worker-supplied pattern so it can
+      // never be fed an unbounded-length string.
+      //
+      // S3 — FAIL CLOSED above the cap (do NOT slice-and-test). Slicing the text
+      // to a prefix before re.test() is UNSOUND for END-ANCHORED / position-
+      // dependent patterns: a `/SAFE$/` can match a truncated prefix that ends in
+      // "SAFE" while the FULL text ends in something else (VERIFIED: 104k text,
+      // prefix ends "SAFE", full ends "MORE" → slice-test=true while full-text
+      // /SAFE$/=false). So truncation can turn a false into a TRUE (a false PASS)
+      // for anchored patterns — the opposite of the old comment's claim. We
+      // cannot soundly evaluate an anchored pattern on a prefix, so over the cap
+      // we return false (not reproduced). That is over-rejection, the SLI's
+      // intended fail-closed stance, and it also defuses any residual catastrophic
+      // pattern on huge input (the engine never runs on >cap text).
+      if (text.length > DEFAULT_MAX_REGEX_TEST_CHARS) {
+        return false;
+      }
       // crit.value already validated at parse time; recompile deterministically.
       const re = new RegExp(crit.value, crit.flags);
-      // Defense-in-depth (codex P2-1): even after the nested-quantifier screen,
-      // cap the input length so a worker-supplied pattern can never be fed an
-      // unbounded-length string. Truncation only shrinks the haystack — it can
-      // turn a true match into a false one (fail-closed: never a false PASS),
-      // never the reverse.
-      const haystack =
-        text.length > DEFAULT_MAX_REGEX_TEST_CHARS
-          ? text.slice(0, DEFAULT_MAX_REGEX_TEST_CHARS)
-          : text;
-      return re.test(haystack);
+      return re.test(text);
     }
     case "empty":
       // Output is "empty" iff it has no non-whitespace characters.
@@ -642,16 +977,82 @@ function reproduceCommand(
   } catch (e) {
     return unreachable({ type: "command", cmd, stage: "resolve-root", error: (e as Error).message });
   }
-  for (const arg of args) {
-    if (arg.startsWith("-")) continue; // flags
-    // Only enforce containment when the token resolves to something existing or
-    // contains a separator; pure pattern args (e.g. a grep regex) are passed
-    // through as literal argv (no shell, so they cannot escape).
-    if (arg.includes("/") || existsSync(pathResolve(realRoot, arg))) {
-      const r = resolveUnderRoot(realRoot, arg);
-      if (!r.ok) {
-        return unreachable({ type: "command", cmd, stage: "resolve-arg", arg, error: r.error });
+  // S2 — flag VALUES that look like paths must be CONTAINED, not blanket-skipped.
+  // The old loop skipped every `-`-prefixed token except a HARD-CODED list of
+  // path-bearing flags, so a non-enumerated path flag (`git diff --output=../x`,
+  // `git log --output=../x`, `git diff -o../x`) WROTE a file OUTSIDE repoRoot via
+  // an allowlisted read-only subcommand and still returned reproduced:true. The
+  // enumerated PATH_BEARING_FLAGS list is open-ended and can NEVER be exhaustive,
+  // so the REAL gate is VALUE-BASED: for ANY flag token, if it carries a
+  // path-looking value (attached `--flag=VALUE` / `-xVALUE`, or a separate next
+  // token), route that value through resolveUnderRoot and reject on escape.
+  // Genuinely path-free values (`--oneline`, `-n5`, `--format=oneline`,
+  // `recurse`) contain no separator → still pass. PATH_BEARING_FLAGS remains a
+  // fast-path hint that FORCES containment of a separate next token even when it
+  // doesn't itself look path-like (e.g. `-C status`, where `status` is a real
+  // contained dir we still want resolved).
+  const pathFlags = PATH_BEARING_FLAGS[head];
+  const checkContained = (value: string): ReproRecord | null => {
+    const r = resolveUnderRoot(realRoot, value);
+    if (!r.ok) {
+      return unreachable({ type: "command", cmd, stage: "resolve-arg", arg: value, error: r.error });
+    }
+    return null;
+  };
+  for (let a = 0; a < args.length; a++) {
+    const arg = args[a]!;
+    if (arg.startsWith("-")) {
+      if (arg.startsWith("--")) {
+        // Long form. Attached `--flag=VALUE`: contain VALUE if it looks like a
+        // path (covers the non-enumerated `--output=../x` escape).
+        const eq = arg.indexOf("=");
+        if (eq !== -1) {
+          const value = arg.slice(eq + 1);
+          if (looksLikePath(realRoot, value)) {
+            const rej = checkContained(value);
+            if (rej) return rej;
+          }
+          continue;
+        }
+        // Separate `--flag VALUE`: contain the next token when it looks like a
+        // path, OR when this is an enumerated path-bearing long flag (hint).
+        const name = arg;
+        const nameIsHinted = pathFlags?.long.has(name) ?? false;
+        const next = args[a + 1];
+        if (next !== undefined && (nameIsHinted || looksLikePath(realRoot, next))) {
+          const rej = checkContained(next);
+          if (rej) return rej;
+          a++; // consume the separate value token
+        }
+        continue;
       }
+      // Short form. Attached `-xVALUE` (`-o../x`, `-Cstatus`): contain the
+      // trailing value when it looks like a path.
+      if (arg.length > 2) {
+        const value = arg.slice(2);
+        if (looksLikePath(realRoot, value)) {
+          const rej = checkContained(value);
+          if (rej) return rej;
+        }
+        continue;
+      }
+      // Bare short `-x`: contain the next token when it looks like a path, OR
+      // when this is an enumerated path-bearing short flag (hint).
+      const shortIsHinted = pathFlags?.short.has(arg) ?? false;
+      const next = args[a + 1];
+      if (next !== undefined && (shortIsHinted || looksLikePath(realRoot, next))) {
+        const rej = checkContained(next);
+        if (rej) return rej;
+        a++; // consume the separate value token
+      }
+      continue;
+    }
+    // A positional token: enforce containment when it resolves to something
+    // existing or contains a separator; pure pattern args (e.g. a grep regex)
+    // are passed through as literal argv (no shell, so they cannot escape).
+    if (looksLikePath(realRoot, arg)) {
+      const rej = checkContained(arg);
+      if (rej) return rej;
     }
   }
 

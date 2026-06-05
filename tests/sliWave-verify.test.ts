@@ -391,3 +391,167 @@ describe("determinism + skip conditions", () => {
     expect(isVerifiedFinding).toBe(true);
   });
 });
+
+// ===========================================================================
+// S5 (Wave 7.1) — ADJACENT vector of the poisoned-getter class in the
+// verifyEvidence:true S3 path. W7 wrapped the dup/adjudicate reads, but the
+// per-claim S3 block (pointerBearingEvidence + parsePointer over a worker
+// pointer + reproduce + criticality + relevance) had NO per-claim catch, so a
+// poisoned `evidence[].pointer.type` getter (or a throwing criticality policy)
+// batch-failed the wave and dropped every sibling receipt (VERIFIED). The S3
+// block is now defensive (worker reads are safeRead-wrapped) AND wrapped in a
+// per-claim try/catch: a throwing reader degrades ONLY that claim (non-
+// authoritative), siblings survive, the promise resolves.
+// ===========================================================================
+describe("S5 (Wave 7.1) — poisoned getter / throwing policy in the S3 verify block (batch survives)", () => {
+  test("a poisoned evidence[].pointer.type getter → that claim non-authoritative; sibling keeps its PASS", async () => {
+    // A pointer whose `type` accessor throws. The defensive parsePointer treats
+    // it as unparseable → null typed pointer → non-reproducible → never
+    // authoritative — without taking down the wave.
+    const poisonedPointer: Record<string, unknown> = {
+      path: "dist/cli.js",
+      mustMatch: { kind: "substring", value: "#!/usr/bin/env node" },
+    };
+    Object.defineProperty(poisonedPointer, "type", {
+      enumerable: true,
+      get() {
+        throw new Error("poisoned pointer.type getter");
+      },
+    });
+    const poisonClaim = {
+      id: "poison_ptr",
+      layer: "BEHAVIOR",
+      assertion: "dist/cli.js exists and is the built CLI entry",
+      evidence: [{ kind: "observed", args: ["s"], pointer: poisonedPointer }],
+      verdict: { status: "PASS" },
+    };
+    const res = await sliWave(["poison_ptr", "honestPass"], {
+      ...baseOpts(entailmentJudge),
+      dispatch: fakeWorker({ poison_ptr: poisonClaim, ...CLAIMS }),
+    });
+    expect(res).toHaveLength(2);
+    // Poison claim: not authoritative (fail-closed), wave NOT taken down.
+    expect(res[0]!.receipt.authoritative).toBe(false);
+    // The honest sibling reproduces + entails → authoritative PASS, untouched.
+    expect(res[1]!.receipt.verdict_adjudicated).toBe("PASS");
+    expect(res[1]!.receipt.authoritative).toBe(true);
+    expect(res[1]!.receipt.claim_id).toBe("honest_pass");
+  });
+
+  test("a THROWING criticality policy on one claim → per-claim ADJUDICATE_THREW BLOCK; sibling survives", async () => {
+    // The criticality policy throws ONLY for the load-bearing claim; the per-claim
+    // S3 try/catch must BLOCK just that claim, never the whole wave.
+    const res = await sliWave(["honestPass", "criticalPlusAdvisory"], {
+      ...baseOpts(entailmentJudge),
+      criticality: (_pointer, _item, claim) => {
+        if ((claim as { id?: string }).id === "honest_pass") {
+          throw new Error("poisoned criticality policy");
+        }
+        return true;
+      },
+    });
+    expect(res).toHaveLength(2);
+    // The claim whose policy threw → per-claim BLOCK, non-authoritative.
+    expect(res[0]!.receipt.verdict_adjudicated).toBe("BLOCK");
+    expect(res[0]!.receipt.rule_codes).toContain("ADJUDICATE_THREW");
+    expect(res[0]!.receipt.authoritative).toBe(false);
+    // The sibling's S3 ran normally → its receipt survives (here a critical
+    // unreachable item makes it non-authoritative, but it RESOLVED with a receipt).
+    expect(res[1]!.receipt.verdict_adjudicated).not.toBe("BLOCK");
+    expect(res[1]!.receipt.claim_id).toBe("crit_plus_adv");
+  });
+
+  test("a genuine CONFIG error (missing repoRoot) still fails LOUD (not swallowed by the per-claim catch)", async () => {
+    // The repoRoot-missing throw is operator misconfiguration, NOT a worker
+    // exploit — it must reject the whole wave consistently, never degrade to a
+    // per-claim receipt.
+    await expect(
+      sliWave(["honestPass"], { ...baseOpts(entailmentJudge), repoRoot: undefined }),
+    ).rejects.toThrow(/repoRoot/);
+  });
+});
+
+// ===========================================================================
+// S5 (Wave 7.1 round-2) — STATEFUL getter inside pointerBearingEvidence.
+// codex round-2 found the prior fix incomplete: the per-property safeReads
+// guarded scalar accessors, but the ARRAY iteration (`for…of ev`) and the
+// args `.filter()` index reads were NOT guarded, and pointerBearingEvidence is
+// called BEFORE the per-claim S3 try. A stateful getter that returns valid data
+// on the first read (so adjudicate() passes) and throws on the SECOND read (in
+// pointerBearingEvidence) rejected the whole wave, dropping every sibling.
+// Arrays are objects too. pointerBearingEvidence is now TOTAL (iteration + filter
+// guarded) so a poisoned evidence[]/args[] index degrades ONLY that claim.
+// ===========================================================================
+describe("S5 (Wave 7.1 r2) — stateful getter in evidence/args iteration (batch survives)", () => {
+  test("poisoned args[0] SECOND read → claim non-authoritative; sibling keeps its PASS", async () => {
+    let reads = 0;
+    const argsArr: string[] = [];
+    Object.defineProperty(argsArr, 0, {
+      enumerable: true,
+      get() {
+        reads++;
+        if (reads > 1) throw new Error("poisoned args[0] second read");
+        return "first";
+      },
+    });
+    (argsArr as { length: number }).length = 1;
+    const poison = {
+      id: "poison_args",
+      layer: "BEHAVIOR",
+      assertion: "dist/cli.js exists and is the built CLI entry",
+      evidence: [
+        {
+          kind: "observed",
+          args: argsArr,
+          pointer: { type: "file", path: "dist/cli.js", mustMatch: { kind: "substring", value: "#!/usr/bin/env node" } },
+        },
+      ],
+      verdict: { status: "PASS" },
+    };
+    const res = await sliWave(["poison_args", "honestPass"], {
+      ...baseOpts(entailmentJudge),
+      dispatch: fakeWorker({ poison_args: poison, ...CLAIMS }),
+    });
+    // The wave RESOLVED (no whole-promise reject) and emitted both receipts —
+    // that is the S5 guarantee. The poisoned args[] degrades to [] (non-load-
+    // bearing: the pointer still reproduces), so this claim may stay authoritative;
+    // what matters is the sibling was never dropped.
+    expect(res).toHaveLength(2);
+    expect(res[0]!.receipt.claim_id).toBe("poison_args");
+    expect(res[1]!.receipt.claim_id).toBe("honest_pass");
+    expect(res[1]!.receipt.authoritative).toBe(true); // sibling survives
+  });
+
+  test("poisoned evidence[0] SECOND read (array index) → claim non-authoritative; sibling survives", async () => {
+    let reads = 0;
+    const entry = {
+      kind: "observed",
+      args: ["s"],
+      pointer: { type: "file", path: "dist/cli.js", mustMatch: { kind: "substring", value: "#!/usr/bin/env node" } },
+    };
+    const evArr: unknown[] = [];
+    Object.defineProperty(evArr, 0, {
+      enumerable: true,
+      get() {
+        reads++;
+        if (reads > 1) throw new Error("poisoned evidence[0] second read");
+        return entry;
+      },
+    });
+    (evArr as { length: number }).length = 1;
+    const poison = {
+      id: "poison_ev",
+      layer: "BEHAVIOR",
+      assertion: "dist/cli.js exists and is the built CLI entry",
+      evidence: evArr,
+      verdict: { status: "PASS" },
+    };
+    const res = await sliWave(["poison_ev", "honestPass"], {
+      ...baseOpts(entailmentJudge),
+      dispatch: fakeWorker({ poison_ev: poison, ...CLAIMS }),
+    });
+    expect(res).toHaveLength(2);
+    expect(res[1]!.receipt.claim_id).toBe("honest_pass");
+    expect(res[1]!.receipt.authoritative).toBe(true);
+  });
+});

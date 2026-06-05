@@ -31,17 +31,28 @@ export function adjudicateBatch(claims) {
   if (!Array.isArray(claims)) {
     throw new Error("adjudicate.mjs: input must be a JSON array of claims");
   }
+  // Read `claim.id` defensively: a worker can ship an object whose `id` accessor
+  // THROWS (poisoned getter). A throwing read must BLOCK only that claim, never
+  // the whole batch (symmetric with src/sliWave.ts). undefined === could-not-read.
+  const readId = (claim) => {
+    try {
+      return claim && typeof claim === "object" && typeof claim.id === "string" ? claim.id : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
   // Pre-scan for duplicate claim_ids (cross-wire hazard).
   const counts = new Map();
   for (const claim of claims) {
-    const id = claim && typeof claim === "object" && typeof claim.id === "string" ? claim.id : undefined;
+    const id = readId(claim);
     if (id !== undefined) counts.set(id, (counts.get(id) ?? 0) + 1);
   }
   const dup = new Set();
   for (const [id, n] of counts) if (n > 1) dup.add(id);
 
   return claims.map((claim) => {
-    const id = claim && typeof claim === "object" && typeof claim.id === "string" ? claim.id : undefined;
+    const id = readId(claim);
     if (id !== undefined && dup.has(id)) {
       return blockResult(id, "MALFORMED_CLAIM", `duplicate claim_id ${JSON.stringify(id)} in batch — BLOCK (no cross-wire)`);
     }

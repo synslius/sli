@@ -1,0 +1,178 @@
+[
+  {
+    "wave_key": "wave_0",
+    "claim_id": "empty_evidence",
+    "layer": "BEHAVIOR",
+    "assertion": "the timestamp migration is complete",
+    "verdict_claimed": "PASS",
+    "verdict_adjudicated": "FLAG",
+    "ok": false,
+    "hard_structural": false,
+    "rule_codes": [
+      "PASS_WITHOUT_EVIDENCE"
+    ],
+    "reproduction": [],
+    "relevance_quorum": null,
+    "relevance_provenance": null,
+    "evidence_verified": null,
+    "authoritative": false,
+    "claim_json": {
+      "id": "empty_evidence",
+      "layer": "BEHAVIOR",
+      "assertion": "the timestamp migration is complete",
+      "evidence": [],
+      "verdict": {
+        "status": "PASS"
+      }
+    },
+    "ts": null
+  },
+  {
+    "wave_key": "wave_1",
+    "claim_id": "admits_missing",
+    "layer": "BEHAVIOR",
+    "assertion": "the timestamp migration is complete",
+    "verdict_claimed": "PASS",
+    "verdict_adjudicated": "FLAG",
+    "ok": false,
+    "hard_structural": false,
+    "rule_codes": [
+      "PASS_WITH_MISSING_EVIDENCE",
+      "PASS_WITHOUT_EVIDENCE",
+      "P_NEEDED"
+    ],
+    "reproduction": [],
+    "relevance_quorum": null,
+    "relevance_provenance": null,
+    "evidence_verified": null,
+    "authoritative": false,
+    "claim_json": {
+      "id": "admits_missing",
+      "layer": "BEHAVIOR",
+      "assertion": "the timestamp migration is complete",
+      "evidence": [
+        {
+          "kind": "missing",
+          "args": [
+            "never actually checked the config"
+          ]
+        }
+      ],
+      "verdict": {
+        "status": "PASS"
+      }
+    },
+    "ts": null
+  },
+  {
+    "wave_key": "wave_2",
+    "claim_id": "inferred_only",
+    "layer": "BEHAVIOR",
+    "assertion": "the timestamp migration is complete",
+    "verdict_claimed": "PASS",
+    "verdict_adjudicated": "FLAG",
+    "ok": true,
+    "hard_structural": false,
+    "rule_codes": [
+      "PASS_WITHOUT_OBSERVED_EVIDENCE"
+    ],
+    "reproduction": [],
+    "relevance_quorum": null,
+    "relevance_provenance": null,
+    "evidence_verified": null,
+    "authoritative": false,
+    "claim_json": {
+      "id": "inferred_only",
+      "layer": "BEHAVIOR",
+      "assertion": "the timestamp migration is complete",
+      "evidence": [
+        {
+          "kind": "inferred",
+          "args": [
+            "it should be done by now"
+          ]
+        }
+      ],
+      "verdict": {
+        "status": "PASS"
+      }
+    },
+    "ts": null
+  },
+  {
+    "wave_key": "wave_3",
+    "claim_id": "motivation_as_proof",
+    "layer": "BEHAVIOR",
+    "assertion": "the timestamp migration is complete",
+    "verdict_claimed": "PASS",
+    "verdict_adjudicated": "FLAG",
+    "ok": false,
+    "hard_structural": false,
+    "rule_codes": [
+      "MOTIVATION_RAISES_TRUTH_CONFIDENCE",
+      "MOTIVATION_NOT_EVIDENCE"
+    ],
+    "reproduction": [],
+    "relevance_quorum": null,
+    "relevance_provenance": null,
+    "evidence_verified": null,
+    "authoritative": false,
+    "claim_json": {
+      "id": "motivation_as_proof",
+      "layer": "BEHAVIOR",
+      "assertion": "the timestamp migration is complete",
+      "evidence": [
+        {
+          "kind": "observed",
+          "args": [
+            "glanced at the dashboard"
+          ]
+        }
+      ],
+      "frame": {
+        "effects": [
+          {
+            "kind": "raise_truth_confidence"
+          }
+        ]
+      },
+      "verdict": {
+        "status": "PASS"
+      }
+    },
+    "ts": null
+  },
+  {
+    "wave_key": "wave_4",
+    "claim_id": "honest_observed",
+    "layer": "BEHAVIOR",
+    "assertion": "the timestamp migration is complete",
+    "verdict_claimed": "PASS",
+    "verdict_adjudicated": "PASS_UNVERIFIED",
+    "ok": true,
+    "hard_structural": false,
+    "rule_codes": [],
+    "reproduction": [],
+    "relevance_quorum": null,
+    "relevance_provenance": null,
+    "evidence_verified": null,
+    "authoritative": false,
+    "claim_json": {
+      "id": "honest_observed",
+      "layer": "BEHAVIOR",
+      "assertion": "the timestamp migration is complete",
+      "evidence": [
+        {
+          "kind": "observed",
+          "args": [
+            "ran the migration and saw it finish"
+          ]
+        }
+      ],
+      "verdict": {
+        "status": "PASS"
+      }
+    },
+    "ts": null
+  }
+]

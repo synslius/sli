@@ -1,0 +1,73 @@
+{
+  "wave_key": "wave_0",
+  "claim_id": "fabricated_present_unrelated",
+  "layer": "BEHAVIOR",
+  "assertion": "dist/cli.js exists and is the built CLI entry",
+  "verdict_claimed": "PASS",
+  "verdict_adjudicated": "PASS_UNVERIFIED",
+  "ok": true,
+  "hard_structural": false,
+  "rule_codes": [],
+  "reproduction": [
+    {
+      "item_ref": "e0",
+      "reproduced": true,
+      "reachable": true,
+      "critical": true,
+      "detail": {
+        "type": "file",
+        "path": "dist/notes.txt",
+        "exists": true,
+        "criterionKind": "substring",
+        "matched": true
+      }
+    }
+  ],
+  "relevance_quorum": false,
+  "relevance_provenance": {
+    "quorum": 2,
+    "items": [
+      {
+        "item_ref": "e0",
+        "judges": [
+          {
+            "judge": 1,
+            "relevant": false
+          },
+          {
+            "judge": 2,
+            "relevant": false
+          }
+        ],
+        "relevant": false
+      }
+    ]
+  },
+  "evidence_verified": false,
+  "authoritative": false,
+  "claim_json": {
+    "id": "fabricated_present_unrelated",
+    "layer": "BEHAVIOR",
+    "assertion": "dist/cli.js exists and is the built CLI entry",
+    "evidence": [
+      {
+        "kind": "observed",
+        "args": [
+          "here is a file, see?"
+        ],
+        "pointer": {
+          "type": "file",
+          "path": "dist/notes.txt",
+          "mustMatch": {
+            "kind": "substring",
+            "value": "groceries"
+          }
+        }
+      }
+    ],
+    "verdict": {
+      "status": "PASS"
+    }
+  },
+  "ts": null
+}

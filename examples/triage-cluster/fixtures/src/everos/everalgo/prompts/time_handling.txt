@@ -1,0 +1,14 @@
+IMPORTANT TIME HANDLING
+
+When the ISO-8601 override slot is disabled, the vendored everalgo default
+prompt is in force. It instructs the model to emit timestamps in the DUAL
+FORMAT block below — both a human-readable form and a machine ISO-8601 form —
+so downstream memcells can be sorted deterministically.
+
+TIME block (dual format):
+  human:  2026-06-04 18:07 PDT
+  iso8601: 2026-06-05T01:07:00Z
+
+This corroborating fixture is content-matched (mustMatch: "IMPORTANT TIME
+HANDLING"). Real-world source (DO NOT depend on this path at proof time):
+the everalgo vendored prompt under the EverOS arsenal.

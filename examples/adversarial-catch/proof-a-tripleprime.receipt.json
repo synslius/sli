@@ -1,0 +1,73 @@
+{
+  "wave_key": "wave_0",
+  "claim_id": "honest_positive",
+  "layer": "BEHAVIOR",
+  "assertion": "dist/cli.js exists and is the built CLI entry",
+  "verdict_claimed": "PASS",
+  "verdict_adjudicated": "PASS",
+  "ok": true,
+  "hard_structural": false,
+  "rule_codes": [],
+  "reproduction": [
+    {
+      "item_ref": "e0",
+      "reproduced": true,
+      "reachable": true,
+      "critical": true,
+      "detail": {
+        "type": "file",
+        "path": "dist/cli.js",
+        "exists": true,
+        "criterionKind": "substring",
+        "matched": true
+      }
+    }
+  ],
+  "relevance_quorum": true,
+  "relevance_provenance": {
+    "quorum": 2,
+    "items": [
+      {
+        "item_ref": "e0",
+        "judges": [
+          {
+            "judge": 1,
+            "relevant": true
+          },
+          {
+            "judge": 2,
+            "relevant": true
+          }
+        ],
+        "relevant": true
+      }
+    ]
+  },
+  "evidence_verified": true,
+  "authoritative": true,
+  "claim_json": {
+    "id": "honest_positive",
+    "layer": "BEHAVIOR",
+    "assertion": "dist/cli.js exists and is the built CLI entry",
+    "evidence": [
+      {
+        "kind": "observed",
+        "args": [
+          "saw dist/cli.js with the shebang"
+        ],
+        "pointer": {
+          "type": "file",
+          "path": "dist/cli.js",
+          "mustMatch": {
+            "kind": "substring",
+            "value": "#!/usr/bin/env node"
+          }
+        }
+      }
+    ],
+    "verdict": {
+      "status": "PASS"
+    }
+  },
+  "ts": null
+}

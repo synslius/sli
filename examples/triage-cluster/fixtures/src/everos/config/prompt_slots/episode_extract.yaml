@@ -1,0 +1,17 @@
+# Bundled fixture for Proof B (self-contained snippet).
+#
+# Real-world source (DO NOT depend on this path at proof time):
+#   EverOS arsenal: src/everos/config/prompt_slots/episode_extract.yaml
+#
+# This is a copy of the operative slice. The load-bearing pointer matches the
+# OPERATIVE key with an anchored regex (^enabled:\s*false) so a comment that
+# merely mentions the word "disabled" cannot satisfy it (round-3 P3).
+#
+# Behavior under test: the ISO-8601 override slot is DISABLED, so the loader
+# yields prompt=None and the vendored everalgo dual-format default is in force.
+
+slot: episode_extract
+description: ISO-8601 timestamp override prompt slot.
+enabled: false
+prompt: |
+  (override prompt body — inert while the slot is disabled)

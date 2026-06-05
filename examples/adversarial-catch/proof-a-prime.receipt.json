@@ -1,0 +1,56 @@
+{
+  "wave_key": "wave_0",
+  "claim_id": "fabricated_absent",
+  "layer": "BEHAVIOR",
+  "assertion": "dist/cli.js exists and is the built CLI entry",
+  "verdict_claimed": "PASS",
+  "verdict_adjudicated": "PASS_UNVERIFIED",
+  "ok": true,
+  "hard_structural": false,
+  "rule_codes": [],
+  "reproduction": [
+    {
+      "item_ref": "e0",
+      "reproduced": false,
+      "reachable": false,
+      "critical": true,
+      "detail": {
+        "type": "file",
+        "path": "dist/does-not-exist.js",
+        "exists": false
+      }
+    }
+  ],
+  "relevance_quorum": true,
+  "relevance_provenance": {
+    "quorum": 2,
+    "items": []
+  },
+  "evidence_verified": false,
+  "authoritative": false,
+  "claim_json": {
+    "id": "fabricated_absent",
+    "layer": "BEHAVIOR",
+    "assertion": "dist/cli.js exists and is the built CLI entry",
+    "evidence": [
+      {
+        "kind": "observed",
+        "args": [
+          "I totally built it"
+        ],
+        "pointer": {
+          "type": "file",
+          "path": "dist/does-not-exist.js",
+          "mustMatch": {
+            "kind": "substring",
+            "value": "#!/usr/bin/env node"
+          }
+        }
+      }
+    ],
+    "verdict": {
+      "status": "PASS"
+    }
+  },
+  "ts": null
+}

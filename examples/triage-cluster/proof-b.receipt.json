@@ -1,0 +1,123 @@
+{
+  "wave_key": "wave_0",
+  "claim_id": "triage_iso8601_disabled",
+  "layer": "BEHAVIOR",
+  "assertion": "the ISO-8601 override slot is disabled, so the dual-format default prompt is in force",
+  "verdict_claimed": "FLAG",
+  "verdict_adjudicated": "FLAG",
+  "ok": true,
+  "hard_structural": false,
+  "rule_codes": [],
+  "reproduction": [
+    {
+      "item_ref": "e0",
+      "reproduced": true,
+      "reachable": true,
+      "critical": true,
+      "detail": {
+        "type": "file",
+        "path": "src/everos/config/prompt_slots/episode_extract.yaml",
+        "exists": true,
+        "criterionKind": "regex",
+        "matched": true
+      }
+    },
+    {
+      "item_ref": "e1",
+      "reproduced": true,
+      "reachable": true,
+      "critical": true,
+      "detail": {
+        "type": "file",
+        "path": "src/everos/everalgo/prompts/time_handling.txt",
+        "exists": true,
+        "criterionKind": "substring",
+        "matched": true
+      }
+    }
+  ],
+  "relevance_quorum": true,
+  "relevance_provenance": {
+    "quorum": 2,
+    "items": [
+      {
+        "item_ref": "e0",
+        "judges": [
+          {
+            "judge": 1,
+            "relevant": true
+          },
+          {
+            "judge": 2,
+            "relevant": true
+          }
+        ],
+        "relevant": true
+      },
+      {
+        "item_ref": "e1",
+        "judges": [
+          {
+            "judge": 1,
+            "relevant": true
+          },
+          {
+            "judge": 2,
+            "relevant": true
+          }
+        ],
+        "relevant": true
+      }
+    ]
+  },
+  "evidence_verified": true,
+  "authoritative": false,
+  "claim_json": {
+    "id": "triage_iso8601_disabled",
+    "layer": "BEHAVIOR",
+    "assertion": "the ISO-8601 override slot is disabled, so the dual-format default prompt is in force",
+    "evidence": [
+      {
+        "kind": "observed",
+        "args": [
+          "episode_extract.yaml shows enabled: false on the operative key"
+        ],
+        "pointer": {
+          "type": "file",
+          "path": "src/everos/config/prompt_slots/episode_extract.yaml",
+          "mustMatch": {
+            "kind": "regex",
+            "value": "^enabled:\\s*false",
+            "flags": "m"
+          }
+        }
+      },
+      {
+        "kind": "observed",
+        "args": [
+          "the vendored everalgo default carries the dual-format TIME block"
+        ],
+        "pointer": {
+          "type": "file",
+          "path": "src/everos/everalgo/prompts/time_handling.txt",
+          "mustMatch": {
+            "kind": "substring",
+            "value": "IMPORTANT TIME HANDLING"
+          }
+        }
+      }
+    ],
+    "probe": {
+      "next": [
+        "confirm no other slot re-enables the override downstream"
+      ]
+    },
+    "verdict": {
+      "status": "FLAG",
+      "reasons": [
+        "override slot disabled; dual-format default active"
+      ]
+    }
+  },
+  "ts": null
+}

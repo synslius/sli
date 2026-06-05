@@ -1,0 +1,22 @@
+{
+  "name": "@sli/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SLI — Self-evidencing Layer Interface wave primitive (Slice 0). ablesyn-gated wave orchestrator + ProofWheel receipts.",
+  "author": "Hengyuan Zhu",
+  "license": "Apache-2.0",
+  "main": "./src/sliWave.ts",
+  "scripts": {
+    "test": "bun test",
+    "adjudicate": "node src/adjudicate.mjs"
+  },
+  "dependencies": {
+    "ablesyn": "file:../ablesyn"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.4.0"
+  }
+}
